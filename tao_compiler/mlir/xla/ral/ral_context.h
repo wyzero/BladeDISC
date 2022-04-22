@@ -134,6 +134,7 @@ class OutputBufferWrapper {
   virtual ~OutputBufferWrapper() {}
   virtual const_buffer_t data() = 0;
   virtual const buffer_shape_t& shape() = 0;
+  virtual void release() = 0;
 };
 
 // Context wrapper for a single execution

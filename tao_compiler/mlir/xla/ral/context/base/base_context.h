@@ -52,6 +52,7 @@ class BaseOutputBufferWrapper : public OutputBufferWrapper {
   const_buffer_t data() override { return data_; }
   const buffer_shape_t& shape() override { return shape_; }
   void set_deleter(Deleter deleter) { deleter_ = deleter; }
+  void release() override { deleter_ = nullptr; }
 
  private:
   buffer_t data_;

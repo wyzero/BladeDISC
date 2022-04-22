@@ -202,6 +202,9 @@ torch::List<torch::Tensor> RalContext::CreateAndBindingOutputs(
         : torch::from_blob(
               const_cast<void*>(out_buf->data()), out_buf->shape(), option)
               .clone();
+    //           const_cast<void*>(out_buf->data()), out_buf->shape(),
+    //           c10::free_cpu, option);
+    // out_buf->release();
     outputs.push_back(out_tensor);
   }
   return outputs;
