@@ -837,9 +837,9 @@ Status CompileFunctionImpl(
                                            output_file_name};
   tao_compiler.SetProgram(tao_compiler_path, tao_compiler_args);
   tao_compiler.SetChannelAction(tensorflow::tao::CHAN_STDOUT,
-                                tensorflow::tao::ACTION_PIPE);
+                                tensorflow::tao::ACTION_DUPPARENT);
   tao_compiler.SetChannelAction(tensorflow::tao::CHAN_STDERR,
-                                tensorflow::tao::ACTION_PIPE);
+                                tensorflow::tao::ACTION_DUPPARENT);
   {
     // We need this trick because OpenBlas has a known bug
     // which leading to deadlock when using fork in multi-thread environment.

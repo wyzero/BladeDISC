@@ -14,6 +14,8 @@
 
 #if defined(TAO_CPU_ONLY) && defined(TAO_ENABLE_MKLDNN)
 
+#include <thread>
+
 #include "dnnl_threadpool_iface.hpp"
 #include "tensorflow/compiler/mlir/xla/ral/context/common_context_impl.h"
 #include "tensorflow/compiler/mlir/xla/ral/context/context_util.h"
@@ -38,7 +40,7 @@ DiscCpuMathKernelMode GetDiscCpuMathKernelMode();
 bool promoteConv1DToConv2D();
 
 // Returns true if weight prepacking is enabled.
-bool enableWeightPrePacking();
+bool isWeightPrePackingEnabled();
 
 // Returns the maximum number of copied we can cache.
 int getWeightPrePackingCacheCapacity();
@@ -68,6 +70,14 @@ inline data_type toDataType<int8_t>() {
   return data_type::s8;
 }
 
+template <class T>
+inline void hash_combine(std::size_t& seed, const T& v) {
+  std::hash<T> hasher;
+  seed ^= hasher(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+}
+
+extern std::thread::id kDiscCpuDefaultThreadId;
+
 struct ConvParams {
   format_tag input_format;
   format_tag filter_format;
@@ -83,6 +93,48 @@ struct ConvParams {
   dims padding_r;
   int groups;
   bool weight_is_const;
+};
+
+struct ConvParamsKey {
+  std::vector<int64_t> src_dims;
+  std::vector<int64_t> weight_dims;
+  std::vector<int64_t> dst_dims;
+  // padding & stride & dilation & groups & weight_is_const ...
+  std::vector<int32_t> metadatas;
+  opaque_t weight_ptr = nullptr;
+  // We need this in case the cased kernel is not thead safe.
+  // To enable large parallelism, we cache the primitive per-thread.
+  std::thread::id tid;
+};
+
+inline bool operator==(const ConvParamsKey& lhs, const ConvParamsKey& rhs) {
+  return (lhs.src_dims == rhs.src_dims && lhs.weight_dims == rhs.weight_dims &&
+          lhs.dst_dims == rhs.dst_dims && lhs.metadatas == rhs.metadatas &&
+          lhs.weight_ptr == rhs.weight_ptr && lhs.tid == rhs.tid);
+}
+
+struct ConvParamsKeyHasher {
+  std::size_t operator()(const ConvParamsKey& key) const {
+    std::size_t seed = std::hash<size_t>()(key.src_dims.size());
+    hash_combine(seed, key.weight_dims.size());
+    hash_combine(seed, key.dst_dims.size());
+    hash_combine(seed, key.metadatas.size());
+    hash_combine(seed, key.weight_ptr);
+    hash_combine(seed, key.tid);
+    for (size_t i = 0; i < key.src_dims.size(); ++i) {
+      hash_combine(seed, key.src_dims[i]);
+    }
+    for (size_t i = 0; i < key.weight_dims.size(); ++i) {
+      hash_combine(seed, key.weight_dims[i]);
+    }
+    for (size_t i = 0; i < key.dst_dims.size(); ++i) {
+      hash_combine(seed, key.dst_dims[i]);
+    }
+    for (size_t i = 0; i < key.metadatas.size(); ++i) {
+      hash_combine(seed, key.metadatas[i]);
+    }
+    return seed;
+  }
 };
 
 template <typename Tinput, int N, typename Tfilter = Tinput,

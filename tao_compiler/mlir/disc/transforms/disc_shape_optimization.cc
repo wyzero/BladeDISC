@@ -501,7 +501,8 @@ LogicalResult ShapeComputationIRAnalysis::buildSymbolicShape(Value value) {
     // Try to check if it's a candidate shape tensor.
     if (isCandidateShapeTensorType(ty)) {
       SmallVector<SymbolicDimOp> symbols;
-      for (int i = 0, d = tensorTy.getShape()[0]; i < d; ++i)
+      int numElems = (tensorTy.getRank() == 0 ? 1 : tensorTy.getShape()[0]);
+      for (int i = 0; i < numElems; ++i)
         symbols.push_back(mgr_.newSymbolicDim());
       shapeTensor2SymDims_[value] = std::move(symbols);
     }
@@ -590,9 +591,14 @@ LogicalResult ShapeComputationIRAnalysis::applyIndexOpConstraint(
 LogicalResult ShapeComputationIRAnalysis::applyShapeTensorOpConstraint(
     Operation* op) {
   if (isa<tensor::FromElementsOp>(op)) {
+    // TODO(disc): support non-rank-1 FromElementsOp.
+    if (op->getResultTypes()[0].cast<RankedTensorType>().getRank() != 1)
+      return success();
     auto& symbols = shapeTensor2SymDims_[op->getResult(0)];
-    if (symbols.size() != op->getOperands().size())
-      op->emitError() << "miss match dim size and num operands\n";
+    if (symbols.size() != op->getNumOperands())
+      return op->emitError()
+             << "miss match dim size and num operands: " << symbols.size()
+             << " vs " << op->getNumOperands();
     for (const auto& z : llvm::zip(op->getOperands(), symbols)) {
       if (failed(mgr_.mapSymbolicDimEqual(value2SymDim_[std::get<0>(z)],
                                           std::get<1>(z))))

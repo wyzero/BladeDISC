@@ -12,7 +12,6 @@
 #if defined(TAO_CPU_ONLY) && defined(TAO_ENABLE_MKLDNN)
 
 #include <sstream>
-#include <thread>
 
 #if defined(TAO_X86)
 #include "mkl.h"
@@ -91,6 +90,8 @@ int initWeightPrePackingCacheCapacity() {
 
 }  // namespace
 
+std::thread::id kDiscCpuDefaultThreadId{};
+
 DiscCpuMathKernelMode GetDiscCpuMathKernelMode() {
   static DiscCpuMathKernelMode mode = initDiscCpuMathKernelMode();
   return mode;
@@ -101,7 +102,7 @@ bool promoteConv1DToConv2D() {
   return enabled;
 }
 
-bool enableWeightPrePacking() {
+bool isWeightPrePackingEnabled() {
   static bool enabled = initEnableWeightPrePacking();
   return enabled;
 }
@@ -171,7 +172,7 @@ void ral_conv(ExecutionContext* ctx, opaque_t /*stream_handle*/,
     // reorder to dst format
     y.reorder_to(params.dst);
   } else {
-    if (params.weight_is_const && enableWeightPrePacking()) {
+    if (params.weight_is_const && isWeightPrePackingEnabled()) {
       ideep::convolution_forward_params conv_params;
       ideep::convolution_forward::prepare<true>(
           conv_params, params.src, params.weight, params.dst_dims, params.dst,
@@ -270,12 +271,6 @@ TAO_RAL_API("ral_conv", "cpu", ral_conv<float, 3>);
 TAO_RAL_API("ral_conv", "cpu", ral_conv<float, 4>);
 TAO_RAL_API("ral_conv", "cpu", ral_conv<float, 5>);
 
-template <class T>
-inline void hash_combine(std::size_t& seed, const T& v) {
-  std::hash<T> hasher;
-  seed ^= hasher(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-}
-
 struct CpuGemmKey {
   int m = -1;
   int n = -1;
@@ -352,8 +347,6 @@ struct MklGemmState : public Context::Resource {
   MklGemmCache cache{getWeightPrePackingCacheCapacity()};
 };
 
-static std::thread::id kMklDefaultThreadId;
-
 #endif
 
 template <typename Tinput, int N = 2, typename Tweight = Tinput,
@@ -369,7 +362,7 @@ void mkl_ral_gemm(ExecutionContext* ctx, void* stream_handle,
   int k = tp_a ? A.sizes[0] : A.sizes[1];
   int n = tp_b ? B.sizes[0] : B.sizes[1];
 
-  if (!enableWeightPrePacking() || !weight_is_const) {
+  if (!isWeightPrePackingEnabled() || !weight_is_const) {
     cblas_sgemm(CblasRowMajor, tp_a ? CblasTrans : CblasNoTrans,
                 tp_b ? CblasTrans : CblasNoTrans, m, n, k, 1.0,
                 reinterpret_cast<Tinput*>(A.data), A.strides[0],
@@ -384,7 +377,7 @@ void mkl_ral_gemm(ExecutionContext* ctx, void* stream_handle,
       unique_name, []() { return new MklGemmState; });
   opaque_t packed_weight;
   {
-    CpuGemmKey key{m, n, k, 1, tp_a, tp_b, B.data, kMklDefaultThreadId};
+    CpuGemmKey key{m, n, k, 1, tp_a, tp_b, B.data, kDiscCpuDefaultThreadId};
     std::lock_guard<std::mutex> l(state->mu);
     auto& cache = state->cache;
     auto it = cache.find(key);
@@ -443,7 +436,7 @@ void onednn_ral_gemm(ExecutionContext* ctx, void* stream_handle,
   int n = tp_b ? B.sizes[0] : B.sizes[1];
 
 #if defined(TAO_X86)
-  if (!enableWeightPrePacking() || !weight_is_const) {
+  if (!isWeightPrePackingEnabled() || !weight_is_const) {
     dnnl::sgemm(tp_a ? 'T' : 'N', tp_b ? 'T' : 'N', m, n, k, 1.0,
                 reinterpret_cast<const float*>(A.data), A.strides[0],
                 reinterpret_cast<const float*>(B.data), B.strides[0], 0.0,
@@ -463,7 +456,7 @@ void onednn_ral_gemm(ExecutionContext* ctx, void* stream_handle,
 
 #if defined(TAO_AARCH64)
   // not using pre-packing path
-  if (!enableWeightPrePacking() || !weight_is_const) {
+  if (!isWeightPrePackingEnabled() || !weight_is_const) {
     ideep::matmul_forward::compute<true>(src, weight, output);
     return;
   }
@@ -632,7 +625,7 @@ void onednn_ral_batch_gemm(ExecutionContext* ctx, void* stream_handle,
   ideep::matmul_forward::compute<true>(src, weight, output);
 #elif defined(TAO_AARCH64)
   // not using pre-packing path
-  if (!enableWeightPrePacking() || !weight_is_const) {
+  if (!isWeightPrePackingEnabled() || !weight_is_const) {
     ideep::matmul_forward::compute<true>(src, weight, output);
     return;
   }

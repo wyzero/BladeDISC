@@ -2558,6 +2558,17 @@ std::unordered_set<string>* GetFusedOpTable() {
 
 std::vector<string> GetDiscSupportedOps() {
   std::vector<string> ops;
+
+  // ops.insert(ops.end(), {
+  //   "QuantizedConv2DWithBiasAndRequantize",
+  //   "Dequantize",
+  //   "QuantizeV2",
+  //   "Const",
+  //   "DepthwiseConv2dNative"
+  // });
+
+  // return ops;
+
   // clang-format off
   ops.insert(ops.end(), {
     "Abs",
@@ -2574,6 +2585,7 @@ std::vector<string> GetDiscSupportedOps() {
     "ConcatV2",
     "Const",
     "Conv2D",
+    "DepthwiseConv2dNative",
     "DynamicStitch",
     "Equal",
     "Erf",

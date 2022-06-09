@@ -661,19 +661,68 @@ Type ToLegalElementType(Type type) {
 }
 
 bool isConstantZeroTensor(Value v) {
+  llvm::dbgs() << "xxxxxx isConstantZeroTensor 1.0\n";
   auto castOp = dyn_cast_or_null<TF::CastOp>(v.getDefiningOp());
   if (castOp) return isConstantZeroTensor(castOp->getOperand(0));
+  llvm::dbgs() << "xxxxxx isConstantZeroTensor 2.0\n";
 
-  DenseElementsAttr denseAttr;
-  if (!matchPattern(v, m_Constant(&denseAttr))) return false;
-  if (denseAttr.getNumElements() != 1 && !denseAttr.isSplat()) return false;
+  auto definingOp = dyn_cast_or_null<TF::ConstOp>(v.getDefiningOp());
+  if (!definingOp) return false;
 
-  Type elemTy = denseAttr.getElementType();
-  if (elemTy.isIntOrIndex()) {
-    return (*denseAttr.getValues<APInt>().begin()).getSExtValue() == 0;
-  } else if (elemTy.isa<FloatType>()) {
-    return (*denseAttr.getValues<APFloat>().begin()).convertToDouble() == 0;
+  auto type = definingOp.getType().cast<RankedTensorType>();
+  auto elemTy = type.getElementType();
+  if (elemTy.isa<mlir::TF::Qint32Type>()) {
+    return true;
   }
+
+  // DenseElementsAttr denseAttr;
+  // if (!matchPattern(v, m_Constant(&denseAttr))) return false;
+  // llvm::dbgs() << "xxxxxx isConstantZeroTensor 3.0\n";
+
+  // Type elemTy = denseAttr.getElementType();
+  // if (denseAttr.getNumElements() == 1 || denseAttr.isSplat()) {
+  //   if (elemTy.isIntOrIndex() || elemTy.isa<mlir::TF::Qint32Type>()) {
+  //     llvm::dbgs() << "xxxxxx isConstantZeroTensor 4.0\n";
+  //     return (*denseAttr.getValues<APInt>().begin()).getSExtValue() == 0;
+  //   } else if (elemTy.isa<FloatType>()) {
+  //     llvm::dbgs() << "xxxxxx isConstantZeroTensor 5.0\n";
+  //     return (*denseAttr.getValues<APFloat>().begin()).convertToDouble() ==
+  //     0;
+  //   }
+  //   return false;
+  // }
+  // llvm::dbgs() << "xxxxxx isConstantZeroTensor 6.0\n";
+
+  // if (elemTy.isIntOrIndex() || elemTy.isa<mlir::TF::Qint32Type>()) {
+  //   llvm::dbgs() << "xxxxxx isConstantZeroTensor 7.0\n";
+  //   for (const auto& val : denseAttr.getValues<APInt>()) {
+  //     if (val.getSExtValue() != 0) {
+  //       llvm::dbgs() << "val.getSExtValue() = " << val.getSExtValue() <<
+  //       "\n"; return false;
+  //     }
+  //   }
+  //   llvm::dbgs() << "xxxxxx isConstantZeroTensor 8.0\n";
+  //   return true;
+  // } else if (elemTy.isa<FloatType>()) {
+  //   llvm::dbgs() << "xxxxxx isConstantZeroTensor 9.0\n";
+  //   for (const auto& val : denseAttr.getValues<APFloat>()) {
+  //     if (val.convertToDouble() != 0) {
+  //       llvm::dbgs() << "val.convertToDouble() = " << val.convertToDouble()
+  //       << "\n"; return false;
+  //     }
+  //   }
+  //   llvm::dbgs() << "xxxxxx isConstantZeroTensor 10.0\n";
+  //   return true;
+  // }
+  // llvm::dbgs() << "xxxxxx isConstantZeroTensor 11.0\n";
+
+  // if (denseAttr.getNumElements() != 1 && !denseAttr.isSplat()) return false;
+
+  // if (elemTy.isIntOrIndex()) {
+  //   return (*denseAttr.getValues<APInt>().begin()).getSExtValue() == 0;
+  // } else if (elemTy.isa<FloatType>()) {
+  //   return (*denseAttr.getValues<APFloat>().begin()).convertToDouble() == 0;
+  // }
   return false;
 }
 
@@ -960,7 +1009,7 @@ LogicalResult matchAndRwriterQuantizedConv2DWithBiasAndRequantizeOp(
 
   // Currently only support const zero bias (a.k.a no bias at all)
   // TODO(disc): support non-zero bias.
-  if (!isConstantZeroTensor(bias)) return success();
+  // if (!isConstantZeroTensor(bias)) return success();
 
   // Currently only support s8s8s8 config.
   // TODO(disc): support other configs.
