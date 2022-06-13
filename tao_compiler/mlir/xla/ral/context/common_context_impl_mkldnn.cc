@@ -145,9 +145,274 @@ struct MkldnnConvState : public Context::Resource {
   std::unordered_map<opaque_t, std::vector<ideep::tensor>> packed_weight_cache;
 };
 
+#if defined(TAO_AARCH64)
 template <typename Tinput, int N, typename Tfilter = Tinput,
           typename Toutput = Tinput>
-void ral_conv(ExecutionContext* ctx, opaque_t /*stream_handle*/,
+bool isACLSupportedDepthwiseConv(
+    ExecutionContext* ctx, opaque_t /*stream_handle*/,
+    MemRefType<Tinput, N> input, MemRefType<Tfilter, N> kernel,
+    MemRefType<int32_t, 1> padding, MemRefType<Toutput, N> output,
+    MemRefType<int32_t, 1> metadata, const ConvParams& params) {
+  // TODO(disc): support other types.
+  if (!std::is_same<Tinput, float>::value ||
+      !std::is_same<Tfilter, float>::value ||
+      !std::is_same<Toutput, float>::value) {
+    return false;
+  }
+  // NHWC + HWIO
+  // TODO(disc): support other formats
+  if (params.input_format == format_tag::acdb &&
+      params.output_format == format_tag::acdb &&
+      params.filter_format == format_tag::cdba && params.is_depthwise) {
+    return true;
+  }
+  return false;
+}
+
+template <typename Tinput, int NDims, typename Tfilter = Tinput,
+          typename Toutput = Tinput>
+void runACLDepthwiseKernel(ExecutionContext* ctx, opaque_t /*stream_handle*/,
+                           MemRefType<Tinput, NDims> input,
+                           MemRefType<Tfilter, NDims> kernel,
+                           MemRefType<int32_t, 1> padding,
+                           MemRefType<Toutput, NDims> output,
+                           MemRefType<int32_t, 1> metadata,
+                           const ConvParams& params, CpuTimer& timer) {
+  auto AclDepthwiseConvCreator = [&]() {
+    std::shared_ptr<AclDepthwiseConvInfo> info(new AclDepthwiseConvInfo);
+    arm_compute::DataLayout data_layout = arm_compute::DataLayout::NHWC;
+
+    int N = input.sizes[0];
+    int Ih = input.sizes[1];
+    int Iw = input.sizes[2];
+    int Ci = input.sizes[3];
+    int Oh = output.sizes[1];
+    int Ow = output.sizes[2];
+    int Co = output.sizes[3];
+    int Kh = params.weight.get_dims()[2];
+    int Kw = params.weight.get_dims()[3];
+
+    if (TAO_VLOG_IS_ON(1)) {
+      TAO_VLOG(0) << "N = " << N;
+      TAO_VLOG(0) << "Ih = " << Ih;
+      TAO_VLOG(0) << "Iw = " << Iw;
+      TAO_VLOG(0) << "Ci = " << Ci;
+      TAO_VLOG(1) << "Oh = " << Oh;
+      TAO_VLOG(1) << "Ow = " << Ow;
+      TAO_VLOG(0) << "Co = " << Co;
+      TAO_VLOG(0) << "Kh = " << Kh;
+      TAO_VLOG(0) << "Kw = " << Kw;
+    }
+
+    auto src_shape = arm_compute::TensorShape(Ci, Iw, Ih, N);
+    auto weights_shape = arm_compute::TensorShape(Co, Kw, Kh, 1);
+    auto dst_shape = arm_compute::TensorShape(Co, Ow, Oh, N);
+
+    arm_compute::DataType data_type = arm_compute::DataType::F32;
+    auto src_info =
+        arm_compute::TensorInfo(src_shape, 1, data_type, data_layout);
+    auto weights_info =
+        arm_compute::TensorInfo(weights_shape, 1, data_type, data_layout);
+    auto dst_info =
+        arm_compute::TensorInfo(dst_shape, 1, data_type, data_layout);
+
+    arm_compute::Tensor& src = info->src;
+    arm_compute::Tensor& weights = info->weights;
+    arm_compute::Tensor& dst = info->dst;
+
+    // Initialize tensors
+    src.allocator()->init(src_info);
+    weights.allocator()->init(weights_info);
+    dst.allocator()->init(dst_info);
+
+    if (!info->depthwise_conv.validate(
+            &src_info, &weights_info, nullptr, &dst_info,
+            arm_compute::PadStrideInfo{
+                params.strides[1], params.strides[0], params.padding_l[1],
+                params.padding_r[1], params.padding_l[0], params.padding_r[0],
+                arm_compute::DimensionRoundingType::FLOOR},
+            /* multiplier */ Co / Ci, arm_compute::ActivationLayerInfo{},
+            arm_compute::Size2D{params.dilates[1], params.dilates[0]})) {
+      ctx->signalError(Context::FAILURE, "fail to validate acl depthwise conv");
+    } else {
+      info->depthwise_conv.configure(
+          &src, &weights, nullptr, &dst,
+          arm_compute::PadStrideInfo{params.strides[1], params.strides[0],
+                                     params.padding_l[1], params.padding_r[1],
+                                     params.padding_l[0], params.padding_r[0],
+                                     arm_compute::DimensionRoundingType::FLOOR},
+          /* multiplier */ Co / Ci, arm_compute::ActivationLayerInfo{},
+          arm_compute::Size2D{params.dilates[1], params.dilates[0]});
+    }
+
+    return info;
+  };
+
+  std::shared_ptr<AclDepthwiseConvInfo> info;
+  if (isWeightPrePackingEnabled() && params.weight_is_const) {
+    std::string unique_name = "disc.ral.cpu.acl_depthwise_conv";
+    auto state = ctx->getOrCreateResource<ACLDepthwiseConvState>(
+        unique_name, []() { return new ACLDepthwiseConvState; });
+    auto key = makeConvParamsKey(input, kernel, padding, output, metadata,
+                                 std::this_thread::get_id());
+    info = state->getOrCreate(key, AclDepthwiseConvCreator);
+  } else {
+    info = AclDepthwiseConvCreator();
+  }
+
+  info->src.allocator()->import_memory(input.data);
+  info->weights.allocator()->import_memory(kernel.data);
+  info->dst.allocator()->import_memory(output.data);
+  info->depthwise_conv.run();
+
+  timer.Stop();
+  if (isProfilingEnabled()) {
+    dumpConvLikeKernelProflingInfo<Tinput, Tfilter, Toutput>(
+        params, timer.GetNanoSeconds(), "ral_cpu_acl_depthwise_conv");
+  }
+}
+
+template <typename Tinput, int N, typename Tfilter = Tinput,
+          typename Toutput = Tinput>
+bool isACLSupportedConv(ExecutionContext* ctx, opaque_t /*stream_handle*/,
+                        MemRefType<Tinput, N> input,
+                        MemRefType<Tfilter, N> kernel,
+                        MemRefType<int32_t, 1> padding,
+                        MemRefType<Toutput, N> output,
+                        MemRefType<int32_t, 1> metadata,
+                        const ConvParams& params) {
+  // TODO(disc): support other types.
+  if (!std::is_same<Tinput, float>::value ||
+      !std::is_same<Tfilter, float>::value ||
+      !std::is_same<Toutput, float>::value) {
+    return false;
+  }
+  // NHWC + OHWI
+  // TODO(disc): support other formats
+  if (params.input_format == format_tag::acdb &&
+      params.output_format == format_tag::acdb &&
+      params.filter_format == format_tag::acdb) {
+    return true;
+  }
+  return false;
+}
+
+template <typename Tinput, int NDims, typename Tfilter = Tinput,
+          typename Toutput = Tinput>
+void runACLConvKernel(ExecutionContext* ctx, opaque_t /*stream_handle*/,
+                      MemRefType<Tinput, NDims> input,
+                      MemRefType<Tfilter, NDims> kernel,
+                      MemRefType<int32_t, 1> padding,
+                      MemRefType<Toutput, NDims> output,
+                      MemRefType<int32_t, 1> metadata, const ConvParams& params,
+                      CpuTimer& timer) {
+  auto AclConvCreator = [&]() {
+    int N = input.sizes[0];
+    int Ih = input.sizes[1];
+    int Iw = input.sizes[2];
+    int Ci = input.sizes[3];
+    int Oh = output.sizes[1];
+    int Ow = output.sizes[2];
+    int Co = output.sizes[3];
+    int Kh = kernel.sizes[1];
+    int Kw = kernel.sizes[2];
+
+    if (TAO_VLOG_IS_ON(1)) {
+      TAO_VLOG(1) << "N = " << N;
+      TAO_VLOG(1) << "Ih = " << Ih;
+      TAO_VLOG(1) << "Iw = " << Iw;
+      TAO_VLOG(1) << "Ci = " << Ci;
+      TAO_VLOG(1) << "Oh = " << Oh;
+      TAO_VLOG(1) << "Ow = " << Ow;
+      TAO_VLOG(1) << "Co = " << Co;
+      TAO_VLOG(1) << "Kh = " << Kh;
+      TAO_VLOG(1) << "Kw = " << Kw;
+      TAO_VLOG(0) << "params.strides[1] = " << params.strides[1];
+      TAO_VLOG(0) << "params.strides[0] = " << params.strides[0];
+      TAO_VLOG(0) << "params.padding_l[1] = " << params.padding_l[1];
+      TAO_VLOG(0) << "params.padding_l[0] = " << params.padding_l[0];
+      TAO_VLOG(0) << "params.padding_r[1] = " << params.padding_r[1];
+      TAO_VLOG(0) << "params.padding_r[0] = " << params.padding_r[0];
+      TAO_VLOG(0) << "params.dilates[1] = " << params.dilates[1];
+      TAO_VLOG(0) << "params.dilates[0] = " << params.dilates[0];
+    }
+
+    std::shared_ptr<AclConvInfo> info(new AclConvInfo);
+
+    arm_compute::DataType data_type = arm_compute::DataType::F32;
+    arm_compute::DataLayout data_layout = arm_compute::DataLayout::NHWC;
+    auto src_shape = arm_compute::TensorShape(Ci, Iw, Ih, N);
+    auto weights_shape = arm_compute::TensorShape(Ci, Kw, Kh, Co);
+    auto dst_shape = arm_compute::TensorShape(Co, Ow, Oh, N);
+
+    auto src_info =
+        arm_compute::TensorInfo(src_shape, 1, data_type, data_layout);
+    auto weights_info =
+        arm_compute::TensorInfo(weights_shape, 1, data_type, data_layout);
+    auto dst_info =
+        arm_compute::TensorInfo(dst_shape, 1, data_type, data_layout);
+
+    arm_compute::Tensor& src = info->src;
+    arm_compute::Tensor& weights = info->weights;
+    arm_compute::Tensor& dst = info->dst;
+
+    // Initialize tensors
+    src.allocator()->init(src_info);
+    weights.allocator()->init(weights_info);
+    dst.allocator()->init(dst_info);
+
+    if (!info->conv.validate(
+            &src_info, &weights_info, nullptr, &dst_info,
+            arm_compute::PadStrideInfo{
+                params.strides[1], params.strides[0], params.padding_l[1],
+                params.padding_r[1], params.padding_l[0], params.padding_r[0],
+                arm_compute::DimensionRoundingType::FLOOR},
+            arm_compute::WeightsInfo{},
+            arm_compute::Size2D{params.dilates[1], params.dilates[0]})) {
+      ctx->signalError(Context::FAILURE, "fail to validate acl depthwise conv");
+    } else {
+      info->conv.configure(
+          &src, &weights, nullptr, &dst,
+          arm_compute::PadStrideInfo{params.strides[1], params.strides[0],
+                                     params.padding_l[1], params.padding_r[1],
+                                     params.padding_l[0], params.padding_r[0],
+                                     arm_compute::DimensionRoundingType::FLOOR},
+          arm_compute::WeightsInfo{},
+          arm_compute::Size2D{params.dilates[1], params.dilates[0]});
+    }
+
+    return info;
+  };
+
+  std::shared_ptr<AclConvInfo> info;
+  if (isWeightPrePackingEnabled() && params.weight_is_const) {
+    std::string unique_name = "tao_ral.cpu.acl_conv";
+    auto state = ctx->getOrCreateResource<ACLConvState>(
+        unique_name, []() { return new ACLConvState; });
+    auto key = makeConvParamsKey(input, kernel, padding, output, metadata,
+                                 std::this_thread::get_id());
+    info = state->getOrCreate(key, AclConvCreator);
+  } else {
+    info = AclConvCreator();
+  }
+
+  info->src.allocator()->import_memory(input.data);
+  info->weights.allocator()->import_memory(kernel.data);
+  info->dst.allocator()->import_memory(output.data);
+  info->conv.run();
+
+  timer.Stop();
+  if (isProfilingEnabled()) {
+    dumpConvLikeKernelProflingInfo<Tinput, Tfilter, Toutput>(
+        params, timer.GetNanoSeconds(), "ral_cpu_acl_conv");
+  }
+}
+
+#endif
+
+template <typename Tinput, int N, typename Tfilter = Tinput,
+          typename Toutput = Tinput>
+void ral_conv(ExecutionContext* ctx, opaque_t stream_handle,
               MemRefType<Tinput, N> input, MemRefType<Tfilter, N> kernel,
               MemRefType<int32_t, 1> padding, MemRefType<Toutput, N> output,
               MemRefType<int32_t, 1> metadata) {
@@ -162,6 +427,19 @@ void ral_conv(ExecutionContext* ctx, opaque_t /*stream_handle*/,
                        &params)) {
     ctx->signalError(Context::FAILURE, "invalid conv params");
   }
+
+#if defined(TAO_AARCH64)
+  if (isACLSupportedDepthwiseConv(ctx, stream_handle, input, kernel, padding,
+                                  output, metadata, params)) {
+    return runACLDepthwiseKernel(ctx, stream_handle, input, kernel, padding,
+                                 output, metadata, params, timer);
+  }
+  if (isACLSupportedConv(ctx, stream_handle, input, kernel, padding, output,
+                         metadata, params)) {
+    return runACLConvKernel(ctx, stream_handle, input, kernel, padding, output,
+                            metadata, params, timer);
+  }
+#endif
 
   // TODO(disc): use context-specific stream/engine
   if (enableInOutLayoutTuning()) {
@@ -213,57 +491,8 @@ void ral_conv(ExecutionContext* ctx, opaque_t /*stream_handle*/,
   timer.Stop();
 
   if (isProfilingEnabled()) {
-    const auto& src_dims = params.src.get_dims();
-    const auto& kernel_dims = params.weight.get_dims();
-    const auto& dst_dims = params.dst.get_dims();
-
-    int64_t bytes =
-        static_cast<int64_t>(params.src.get_nelems()) * sizeof(Tinput) +
-        static_cast<int64_t>(params.weight.get_nelems()) * sizeof(Tfilter) +
-        static_cast<int64_t>(params.dst.get_nelems()) * sizeof(Toutput);
-
-    // N * OC * OH * OW * KH * KW * KIC
-    int64_t gflops = 2 * static_cast<int64_t>(params.dst.get_nelems()) *
-                     static_cast<int64_t>(params.weight.get_nelems()) /
-                     kernel_dims[0];
-
-    std::ostringstream sout;
-    sout << "ral_cpu_conv:\n";
-    sout << "  input logical NCHW shape:\n\t";
-    for (const auto& d : src_dims) {
-      sout << d << " ";
-    }
-    sout << "\n  kernel logical OIHW shape:\n\t";
-    for (const auto& d : kernel_dims) {
-      sout << d << " ";
-    }
-    sout << "\n  output logical NCHW shape:\n\t";
-    for (const auto& d : dst_dims) {
-      sout << d << " ";
-    }
-    sout << "\n  strides:\n\t";
-    for (size_t i = 0; i < params.strides.size(); ++i) {
-      sout << params.strides[i] << " ";
-    }
-    sout << "\n  dilates:\n\t";
-    for (size_t i = 0; i < params.dilates.size(); ++i) {
-      sout << params.dilates[i] << " ";
-    }
-    sout << "\n  paddings_l:\n\t";
-    for (size_t i = 0; i < params.padding_l.size(); ++i) {
-      sout << params.padding_l[i] << " ";
-    }
-    sout << "\n  paddings_r:\n\t";
-    for (size_t i = 0; i < params.padding_r.size(); ++i) {
-      sout << params.padding_r[i] << " ";
-    }
-    TAO_VLOG(0) << sout.str() << "\n roofline:\n"
-                << "\tMath Ops = " << gflops << "\n"
-                << "\tBytes = " << bytes << "\n"
-                << "\tBandwidth = "
-                << double(bytes) / double(timer.GetNanoSeconds()) << " GB\n"
-                << "\tGFLOPS = "
-                << double(gflops) / double(timer.GetNanoSeconds()) << "\n";
+    dumpConvLikeKernelProflingInfo<Tinput, Tfilter, Toutput>(
+        params, timer.GetNanoSeconds(), "ral_cpu_conv");
   }
 }
 
