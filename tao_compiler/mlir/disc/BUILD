@@ -1949,6 +1949,34 @@ tf_cc_binary(
     ],
 )
 
+tf_cc_binary(
+    name = "disc-pdll",
+    srcs = [
+        "tools/disc-pdll/disc-pdll.cc",
+    ],
+    deps = [
+        ":all_passes",
+        ":disc_ral",
+        ":mhlo_disc",
+        ":lmhlo_disc",
+        "//tensorflow/compiler/xla/mlir_hlo:all_passes",
+        "//tensorflow/compiler/xla/mlir_hlo:mlir_hlo",
+        "//tensorflow/compiler/xla/mlir_hlo:lhlo",
+        "//tensorflow/compiler/xla/mlir_hlo:lhlo_gpu",
+        "@boringssl//:crypto",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:AllPassesAndDialects",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:MlirOptLib",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:Support",
+        "@llvm-project//mlir:PDLLAST",
+        "@llvm-project//mlir:PDLLCodeGen",
+        "@llvm-project//mlir:PDLLODS",
+        "@llvm-project//mlir:PDLLParser",
+    ],
+)
+
 gentbl_cc_library(
     name = "MhloDiscPassIncGen",
     compatible_with = get_compatible_with_cloud(),

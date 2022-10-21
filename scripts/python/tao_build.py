@@ -363,8 +363,10 @@ def build_tao_compiler(root, args):
 
         flag = build_tao_compiler_add_flags_platform_alibaba(root, args, flag)
 
-        bazel_build(TARGET_TAO_COMPILER_MAIN, flag=flag)
-        bazel_build(TARGET_DISC_OPT, flag=flag)
+        bazel_build("@llvm-project//mlir:mlir-pdll", flag=flag)
+        bazel_build("//tensorflow/compiler/mlir/disc:disc-pdll", flag=flag)
+        #bazel_build(TARGET_TAO_COMPILER_MAIN, flag=flag)
+        #bazel_build(TARGET_DISC_OPT, flag=flag)
         # TODO:(fl237079) Support disc_replay for rocm version
         if not args.rocm and not args.dcu:
             bazel_build(TARGET_DISC_REPLAY, flag=flag)
