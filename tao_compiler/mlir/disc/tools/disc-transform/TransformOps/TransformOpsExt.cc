@@ -34,6 +34,7 @@
 #include "mlir/Dialect/PDL/IR/PDLTypes.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/IR/TransformInterfaces.h"
+#include "mlir/IR/BlockAndValueMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Pass/PassManager.h"
@@ -1776,6 +1777,213 @@ DiagnosedSilenceableFailure ConvertPaddingPlaceholderToConstOp::applyToOne(
       b.create<arith::ConstantOp>(target->getLoc(), placeholderOp.getValue());
   target->replaceAllUsesWith(constOp->getResults());
   results.assign({constOp.getOperation()});
+  return DiagnosedSilenceableFailure(success());
+}
+
+//===---------------------------------------------------------------------===//
+// ReductionOutputFuseOp
+//===---------------------------------------------------------------------===//
+
+namespace {
+
+Operation* convertGenericOpToConditionalGenericOp(OpBuilder& b, Value pred,
+                                                  linalg::LinalgOp linalgOp) {
+  SmallVector<Value> inputs{pred};
+  inputs.append(linalgOp.getDpsInputOperands());
+  SmallVector<Value> outputs = linalgOp.getDpsInitOperands();
+  SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
+  if (indexingMaps.empty()) return nullptr;
+  SmallVector<AffineMap> newIndexingMaps;
+  newIndexingMaps.push_back(AffineMap::get(indexingMaps.back().getNumDims(),
+                                           indexingMaps[0].getNumSymbols(), {},
+                                           b.getContext()));
+  newIndexingMaps.append(std::move(indexingMaps));
+  SmallVector<StringRef> iterators = linalgOp.getIteratorTypesArray();
+  SmallVector<Type> resultTypes = linalgOp.hasTensorSemantics()
+                                      ? TypeRange(ValueRange(outputs))
+                                      : TypeRange{};
+  SmallVector<NamedAttribute> attrs;
+  for (auto attr : linalgOp->getAttrs()) {
+    if (attr.getName().getValue().starts_with("disc"))
+      attrs.push_back(std::move(attr));
+  }
+  auto bodyBuilder = [&](OpBuilder& innerBuilder, Location loc,
+                         ValueRange operands) {
+    BlockAndValueMapping mapping;
+    mapping.map(linalgOp.getBlock()->getArguments(), operands.drop_front());
+    for (Operation& op : linalgOp.getBlock()->without_terminator()) {
+      innerBuilder.clone(op, mapping);
+    }
+    SmallVector<Value> newResults;
+    for (Value v : linalgOp.getBlock()->getTerminator()->getOperands()) {
+      newResults.push_back(mapping.lookupOrDefault(v));
+    }
+    innerBuilder.create<disc_linalg_ext::YieldOp>(
+        linalgOp.getBlock()->getTerminator()->getLoc(), newResults);
+  };
+  auto conditionalGenericOp = b.create<disc_linalg_ext::ConditionalGenericOp>(
+      linalgOp.getLoc(), resultTypes, inputs, outputs, newIndexingMaps,
+      iterators, bodyBuilder, attrs);
+  return conditionalGenericOp;
+}
+
+}  // namespace
+
+void ReductionOutputFuseOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance>& effects) {
+  transform::consumesHandle({this->getOperation()->getOperand(0)}, effects);
+  transform::consumesHandle({this->getOperation()->getOperand(1)}, effects);
+  transform::producesHandle(this->getOperation()->getResults(), effects);
+  transform::modifiesPayload(effects);
+}
+
+DiagnosedSilenceableFailure ReductionOutputFuseOp::apply(
+    transform::TransformResults& results, transform::TransformState& state) {
+  ArrayRef<Operation*> targetOps = state.getPayloadOps(getTarget());
+  if (targetOps.size() != 1)
+    return mlir::emitDefiniteFailure(this->getOperation(),
+                                     "expect only one target but got ")
+           << targetOps.size();
+  Operation* target = targetOps[0];
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(target);
+  if (!linalgOp)
+    return mlir::emitDefiniteFailure(this->getOperation(),
+                                     "expect the target is a linalg op");
+
+  ArrayRef<Operation*> loopOps = state.getPayloadOps(getLoop());
+  if (loopOps.size() != 1)
+    return mlir::emitDefiniteFailure(this->getOperation(),
+                                     "expect only one loop but got ")
+           << loopOps.size();
+  auto forOp = dyn_cast<scf::ForOp>(loopOps[0]);
+  if (!forOp)
+    return mlir::emitDefiniteFailure(this->getOperation(),
+                                     "expect the loop to a for op");
+
+  // Check all the outputs of the linalg have the same affine map.
+  if (linalgOp->getNumResults() < 1)
+    return mlir::emitDefiniteFailure(
+        this->getOperation(), "expect the target has at least one result");
+  auto operands = linalgOp.getDpsInitOperands();
+  auto indexMap = linalgOp.getMatchingIndexingMap(operands.front());
+  AffineMap resultIndexMap;
+  for (auto [idx, operand] : llvm::enumerate(linalgOp.getDpsInitOperands())) {
+    auto indexMap = linalgOp.getMatchingIndexingMap(operand);
+    if (idx == 0) {
+      resultIndexMap = indexMap;
+    } else if (resultIndexMap != indexMap) {
+      return mlir::emitDefiniteFailure(
+          this->getOperation(),
+          "expect all the results of the target have the same shape");
+    }
+  }
+
+  // result of for op -> result idx.
+  DenseMap<Value, int> forOpResultMap;
+  for (auto [idx, result] : llvm::enumerate(forOp->getResults())) {
+    forOpResultMap[result] = idx;
+  }
+  // linalg operand idx -> result idx of for op.
+  DenseMap<int, int> linalgOperandToForResultMap;
+  for (auto [idx, operand] : llvm::enumerate(linalgOp.getDpsInputOperands())) {
+    auto it = forOpResultMap.find(operand->get());
+    if (it == forOpResultMap.end()) continue;
+    auto indexMap = linalgOp.getMatchingIndexingMap(operand);
+    if (resultIndexMap != indexMap) {
+      return mlir::emitDefiniteFailure(
+          this->getOperation(),
+          "expect all the results of for loop which are consumed by the target "
+          "have the same shape as the results of linalg op");
+    }
+    linalgOperandToForResultMap[idx] = it->second;
+  }
+  if (linalgOperandToForResultMap.empty()) {
+    return mlir::emitDefiniteFailure(
+        this->getOperation(),
+        "none of the results of the reduction loop are consumed by target\n");
+  }
+
+  OpBuilder b(target);
+  auto newInitArgs = llvm::to_vector<>(forOp.getInitArgs());
+  for (auto operand : linalgOp.getDpsInitOperands())
+    newInitArgs.push_back(operand->get());
+  auto newForOp =
+      b.create<scf::ForOp>(forOp.getLoc(), forOp.getLowerBound(),
+                           forOp.getUpperBound(), forOp.getStep(), newInitArgs);
+  BlockAndValueMapping mapping;
+  mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+  for (auto [oldValue, newValue] :
+       llvm::zip(forOp.getRegionIterArgs(), newForOp.getRegionIterArgs())) {
+    mapping.map(oldValue, newValue);
+  }
+  for (auto [oldValue, newValue] :
+       llvm::zip(linalgOp.getDpsInitOperands(),
+                 newForOp.getRegionIterArgs().drop_front(
+                     forOp.getRegionIterArgs().size()))) {
+    mapping.map(oldValue->get(), newValue);
+  }
+  b.setInsertionPoint(newForOp.getBody(), newForOp.getBody()->begin());
+  for (auto& op : (*forOp.getBody()).without_terminator()) {
+    b.clone(op, mapping);
+  }
+  auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  auto forResultIdx = linalgOperandToForResultMap.begin()->second;
+  auto insertSliceOp = mapping.lookup(yieldOp->getOperand(forResultIdx))
+                           .getDefiningOp<tensor::InsertSliceOp>();
+  if (!insertSliceOp) {
+    return mlir::emitDefiniteFailure(
+        this->getOperation(),
+        "insert_slice op not found for target result of for op\n");
+  }
+  for (auto [oldValue, newValue] :
+       llvm::zip(forOp->getResults(), yieldOp->getOperands())) {
+    mapping.map(oldValue, mapping.lookup(newValue));
+  }
+  auto clonedTarget = b.clone(*target, mapping);
+  auto tileableTarget = cast<TilingInterface>(clonedTarget);
+  FailureOr<Value> tiledTarget = tileableTarget.generateResultTileValue(
+      b, 0, insertSliceOp.getMixedOffsets(), insertSliceOp.getMixedSizes());
+  if (failed(tiledTarget)) {
+    return mlir::emitDefiniteFailure(this->getOperation(),
+                                     "failed to tile target op\n");
+  }
+  Operation* tiledOp = tiledTarget->getDefiningOp();
+  Value iv = newForOp.getInductionVar();
+  Value nextIv =
+      b.create<arith::AddIOp>(tiledOp->getLoc(), iv, newForOp.getStep());
+  Value pred =
+      b.create<arith::CmpIOp>(tiledOp->getLoc(), arith::CmpIPredicate::sge,
+                              nextIv, newForOp.getUpperBound());
+  auto conditionalGenericOp = convertGenericOpToConditionalGenericOp(
+      b, pred, cast<linalg::LinalgOp>(tiledOp));
+  if (!conditionalGenericOp) {
+    return mlir::emitDefiniteFailure(
+        this->getOperation(), "failed to build conditional_generic op\n");
+  }
+  SmallVector<Value> newResults;
+  for (Value v : yieldOp->getOperands()) {
+    newResults.push_back(mapping.lookup(v));
+  }
+  // insert_slice for the results of tiled op
+  for (auto [updateValue, initValue] :
+       llvm::zip(conditionalGenericOp->getResults(),
+                 newForOp.getRegionIterArgs().drop_front(
+                     forOp.getRegionIterArgs().size()))) {
+    newResults.push_back(b.create<tensor::InsertSliceOp>(
+                              tiledOp->getLoc(), updateValue, initValue,
+                              insertSliceOp.getMixedOffsets(),
+                              insertSliceOp.getMixedSizes(),
+                              insertSliceOp.getMixedStrides())
+                             ->getResult(0));
+  }
+  b.create<scf::YieldOp>(yieldOp->getLoc(), newResults);
+
+  forOp->replaceAllUsesWith(
+      newForOp->getResults().take_front(forOp->getNumResults()));
+  linalgOp->replaceAllUsesWith(
+      newForOp->getResults().drop_front(forOp->getNumResults()));
+  results.set(getTiledTarget().cast<OpResult>(), {conditionalGenericOp});
+  results.set(getFusedLoop().cast<OpResult>(), {newForOp});
   return DiagnosedSilenceableFailure(success());
 }
 
