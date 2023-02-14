@@ -1916,28 +1916,33 @@ DiagnosedSilenceableFailure ReductionOutputFuseOp::apply(
        llvm::zip(forOp.getRegionIterArgs(), newForOp.getRegionIterArgs())) {
     mapping.map(oldValue, newValue);
   }
-  for (auto [oldValue, newValue] :
-       llvm::zip(linalgOp.getDpsInitOperands(),
-                 newForOp.getRegionIterArgs().drop_front(
-                     forOp.getRegionIterArgs().size()))) {
-    mapping.map(oldValue->get(), newValue);
+  // move ops in the block of old for op to the block of new for op.
+  for (auto val : forOp.getBody()->getArguments()) {
+    val.replaceAllUsesWith(mapping.lookup(val));
   }
-  b.setInsertionPoint(newForOp.getBody(), newForOp.getBody()->begin());
-  for (auto& op : (*forOp.getBody()).without_terminator()) {
-    b.clone(op, mapping);
-  }
-  auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  newForOp.getBody()->getOperations().splice(newForOp.getBody()->end(),
+                                             forOp.getBody()->getOperations());
+  auto terminatorOp = newForOp.getBody()->getTerminator();
+  b.setInsertionPoint(terminatorOp);
   auto forResultIdx = linalgOperandToForResultMap.begin()->second;
-  auto insertSliceOp = mapping.lookup(yieldOp->getOperand(forResultIdx))
+  auto insertSliceOp = terminatorOp->getOperand(forResultIdx)
                            .getDefiningOp<tensor::InsertSliceOp>();
   if (!insertSliceOp) {
     return mlir::emitDefiniteFailure(
         this->getOperation(),
         "insert_slice op not found for target result of for op\n");
   }
+
+  // clone and tile the target op to the block of new for op.
   for (auto [oldValue, newValue] :
-       llvm::zip(forOp->getResults(), yieldOp->getOperands())) {
-    mapping.map(oldValue, mapping.lookup(newValue));
+       llvm::zip(linalgOp.getDpsInitOperands(),
+                 newForOp.getRegionIterArgs().drop_front(
+                     forOp.getRegionIterArgs().size()))) {
+    mapping.map(oldValue->get(), newValue);
+  }
+  for (auto [oldValue, newValue] :
+       llvm::zip(forOp->getResults(), terminatorOp->getOperands())) {
+    mapping.map(oldValue, newValue);
   }
   auto clonedTarget = b.clone(*target, mapping);
   auto tileableTarget = cast<TilingInterface>(clonedTarget);
@@ -1960,10 +1965,7 @@ DiagnosedSilenceableFailure ReductionOutputFuseOp::apply(
     return mlir::emitDefiniteFailure(
         this->getOperation(), "failed to build conditional_generic op\n");
   }
-  SmallVector<Value> newResults;
-  for (Value v : yieldOp->getOperands()) {
-    newResults.push_back(mapping.lookup(v));
-  }
+  auto newResults = llvm::to_vector<>(terminatorOp->getOperands());
   // insert_slice for the results of tiled op
   for (auto [updateValue, initValue] :
        llvm::zip(conditionalGenericOp->getResults(),
@@ -1976,7 +1978,7 @@ DiagnosedSilenceableFailure ReductionOutputFuseOp::apply(
                               insertSliceOp.getMixedStrides())
                              ->getResult(0));
   }
-  b.create<scf::YieldOp>(yieldOp->getLoc(), newResults);
+  terminatorOp->setOperands(newResults);
 
   forOp->replaceAllUsesWith(
       newForOp->getResults().take_front(forOp->getNumResults()));
