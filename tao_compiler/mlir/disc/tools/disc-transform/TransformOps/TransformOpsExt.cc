@@ -2074,6 +2074,71 @@ DiagnosedSilenceableFailure ReductionInputFuseOp::apply(
   return DiagnosedSilenceableFailure(success());
 }
 
+//===---------------------------------------------------------------------===//
+// ReplaceAndRemoveLoopIterArgOp
+//===---------------------------------------------------------------------===//
+
+void ReplaceAndRemoveLoopIterArgOp::build(OpBuilder& builder,
+                                          OperationState& result, Value target,
+                                          int64_t from, int64_t to) {
+  MLIRContext* ctx = builder.getContext();
+  result.addOperands(target);
+  result.addAttribute(
+      ReplaceAndRemoveLoopIterArgOp::getFromAttrName(result.name),
+      builder.getIntegerAttr(builder.getIntegerType(64), from));
+  result.addAttribute(ReplaceAndRemoveLoopIterArgOp::getToAttrName(result.name),
+                      builder.getIntegerAttr(builder.getIntegerType(64), to));
+  result.addTypes({pdl::OperationType::get(ctx)});
+}
+
+DiagnosedSilenceableFailure ReplaceAndRemoveLoopIterArgOp::applyToOne(
+    Operation* target, SmallVectorImpl<Operation*>& results,
+    transform::TransformState& state) {
+  auto forOp = dyn_cast<scf::ForOp>(target);
+  if (!forOp) {
+    return mlir::emitDefiniteFailure(target, "applies only to scf::ForOp");
+  }
+  MLIRContext* ctx = target->getContext();
+
+  OpBuilder b(target);
+  forOp->getResult(getFrom()).replaceAllUsesWith(forOp->getResult(getTo()));
+  SmallVector<Value> newIterOperands;
+  for (auto [idx, val] : llvm::enumerate(forOp.getIterOperands()))
+    if (idx != getFrom()) newIterOperands.push_back(val);
+
+  auto newForOp = b.create<scf::ForOp>(forOp.getLoc(), forOp.getLowerBound(),
+                                       forOp.getUpperBound(), forOp.getStep(),
+                                       newIterOperands);
+  BlockAndValueMapping mapping;
+  mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+  for (auto [idx, val] : llvm::enumerate(forOp.getRegionIterArgs())) {
+    if (idx < getFrom()) {
+      mapping.map(val, newForOp.getRegionIterArg(idx));
+    } else if (idx > getFrom()) {
+      mapping.map(val, newForOp.getRegionIterArg(idx - 1));
+    }
+  }
+  mapping.map(forOp.getRegionIterArg(getFrom()),
+              mapping.lookup(forOp.getRegionIterArg(getTo())));
+  for (Value val : forOp.getBody()->getArguments()) {
+    val.replaceAllUsesWith(mapping.lookup(val));
+  }
+  newForOp.getBody()->getOperations().splice(newForOp.getBody()->end(),
+                                             forOp.getBody()->getOperations());
+  newForOp.getBody()->getTerminator()->eraseOperand(getFrom());
+  for (auto [idx, val] : llvm::enumerate(forOp->getResults())) {
+    if (idx < getFrom()) {
+      val.replaceAllUsesWith(newForOp->getResult(idx));
+    } else if (idx > getFrom()) {
+      val.replaceAllUsesWith(newForOp->getResult(idx - 1));
+    }
+  }
+  forOp->erase();
+
+  results.assign({newForOp.getOperation()});
+  return DiagnosedSilenceableFailure(success());
+}
+
 }  // namespace transform_dialect
 
 void registerTransformDialectCommonExtension(DialectRegistry& registry) {

@@ -640,4 +640,57 @@ def ReductionInputFuseOp : Op<Transform_Dialect, "disc.reduction_input_fuse",
   let cppNamespace = "::mlir::disc_ral::transform_dialect";
 }
 
+def ReplaceAndRemoveLoopIterArgOp : Op<Transform_Dialect, "disc.replace_and_remove_loop_iter_arg",
+    [FunctionalStyleTransformOpTrait,
+     MemoryEffectsOpInterface,
+     TransformEachOpTrait,
+     TransformOpInterface]> {
+  let description = [{
+    Given a scf.for op, replace one of its iter arg with anohter iter arg, and then remove such
+    iter arg.
+
+    Returns the updated loop.
+
+    Example:
+     convert from:
+     ```
+      scf.for %iv = %c0 to %d0 step %step iter_args(%v0 = ..., %v1 = ...) {
+        ...
+        use(v0)
+        ...
+        scf.yield %v0, %v1 : ...
+      }
+     ```
+     to (replace v0 with v1 and remove v0):
+     ```
+      scf.for %iv = %c0 to %d0 step %step iter_args(%v1 = ...) {
+        ...
+        use(v1)
+        ...
+        scf.yield %v1 : ...
+      }
+     ```
+
+  }];
+
+  let arguments = (ins PDL_Operation:$target,
+                       I64Attr:$from,
+                       I64Attr:$to);
+  let results = (outs PDL_Operation:$result);
+
+  let assemblyFormat = "$target attr-dict";
+  let cppNamespace = "::mlir::disc_ral::transform_dialect";
+
+  let builders = [
+    OpBuilder<(ins "Value":$target, "int64_t":$from, "int64_t":$to)>
+  ];
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::Operation *target,
+        ::llvm::SmallVectorImpl<::mlir::Operation *> &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
 #endif // DISC_TRANSFORM_OPS_EXT
