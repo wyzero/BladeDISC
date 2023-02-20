@@ -96,8 +96,7 @@ LogicalResult comprehensiveBufferizeDeallocationFn(OpBuilder& builder,
 
 LogicalResult comprehensiveBufferizeCopyFn(OpBuilder& builder, Location loc,
                                            Value from, Value to) {
-  createLinalgCopyOp(builder, loc, from, to);
-  return success();
+  return success(createLinalgCopyOp(builder, loc, from, to) != nullptr);
 }
 
 OneShotBufferizationOptions getBufferizationOptions() {
@@ -557,6 +556,63 @@ struct FoldXferReadOfXferWriterPattern
   }
 };
 
+/// convert:
+///   %0 = vector.transfer_read %0, %cst : vector<8x12xf32>
+///   %1 = arith.select %pred, %0, %vector_cst : vector<8x12xf32>
+///   %2 = vector.transfer_write %1, %0[...]
+///   %3 = vector.transfer_read %0[...], %cst : vector<8x12xf32>
+///   use(%3)
+/// to:
+///   %0 = vector.transfer_read %0, %cst : vector<8x12xf32>
+///   %1 = arith.select %pred, %0, %vector_cst : vector<8x12xf32>
+///   use(%1)
+struct FoldXferReadOfXferWriterWithSelectPattern
+    : public OpRewritePattern<vector::TransferReadOp> {
+  using OpRewritePattern<vector::TransferReadOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::TransferReadOp op,
+                                PatternRewriter& rewriter) const override {
+    // Find xfer write op
+    auto writeOp = op.getSource().getDefiningOp<vector::TransferWriteOp>();
+    if (!writeOp || writeOp.getVector().getType() != op->getResult(0).getType())
+      return failure();
+
+    // Find select op
+    auto selectOp = writeOp.getVector().getDefiningOp<arith::SelectOp>();
+    if (!selectOp ||
+        selectOp->getResult(0).getType() != op->getResult(0).getType())
+      return failure();
+
+    // find const op and another xfer read op
+    auto prevReadOp =
+        selectOp->getOperand(1).getDefiningOp<vector::TransferReadOp>();
+    auto vectorConstOp =
+        selectOp->getOperand(2).getDefiningOp<arith::ConstantOp>();
+    if (!vectorConstOp || !prevReadOp) {
+      prevReadOp =
+          selectOp->getOperand(2).getDefiningOp<vector::TransferReadOp>();
+      vectorConstOp =
+          selectOp->getOperand(1).getDefiningOp<arith::ConstantOp>();
+    }
+    if (!vectorConstOp || !prevReadOp) return failure();
+    auto denseAttr = vectorConstOp.getValue().cast<DenseElementsAttr>();
+    if (!denseAttr.isSplat()) return failure();
+
+    // check the first read op and the second read have the same padding value
+    if (op.getPadding() != prevReadOp.getPadding()) return failure();
+
+    // check the padding value for xfer read op is a const
+    auto scalarConstOp = op.getPadding().getDefiningOp<arith::ConstantOp>();
+    if (!scalarConstOp) return failure();
+
+    if (*denseAttr.getValues<Attribute>().begin() != scalarConstOp.getValue())
+      return failure();
+
+    rewriter.replaceOp(op, selectOp->getResults());
+    return success();
+  }
+};
+
 static void addAllRegisteredCanonicalizationPatterns(
     RewritePatternSet& patterns) {
   MLIRContext* ctx = patterns.getContext();
@@ -574,6 +630,7 @@ static void addAllRegisteredCanonicalizationPatterns(
   patterns.insert<FoldMultiLevelPackOfConstantWrapperPattern>(ctx);
   patterns.insert<FoldTensorExtractOfConstantWrapperPattern>(ctx);
   patterns.insert<FoldXferReadOfXferWriterPattern>(ctx);
+  patterns.insert<FoldXferReadOfXferWriterWithSelectPattern>(ctx);
 }
 
 }  // namespace
@@ -2515,7 +2572,6 @@ DiagnosedSilenceableFailure VectorizeConditionalGenericOp::applyToOne(
   }
 
   MLIRContext* ctx = target->getContext();
-  OpBuilder builder(ctx);
   IRRewriter rewriter(ctx);
   Location loc = genericOp->getLoc();
   Value pred = genericOp->getOperand(0);
@@ -2560,10 +2616,11 @@ DiagnosedSilenceableFailure VectorizeConditionalGenericOp::applyToOne(
       convertConditionalGenericOpToGenericOp(rewriter, linalgOp));
   elseTarget.getBlock()->getTerminator()->setOperands(
       elseTarget.getRegionOutputArgs());
-  for (auto& op : llvm::make_early_inc_range(
-           elseTarget.getBlock()->without_terminator())) {
-    op.erase();
+  SmallVector<Operation*> toDeleteOps;
+  for (auto& op : llvm::reverse(elseTarget.getBlock()->without_terminator())) {
+    toDeleteOps.push_back(&op);
   }
+  for (Operation* op : toDeleteOps) op->erase();
   // simply forward init input tensors to corresponding outputs in the else
   // branch.
   rewriter.create<scf::YieldOp>(loc, elseTarget->getResults());
